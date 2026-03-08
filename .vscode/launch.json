@@ -1,0 +1,173 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "test_ffpp_ds",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "torch.distributed.run",
+            "console": "integratedTerminal",
+            "justMyCode": false, // Set to false to debug into DeepSpeed/PyTorch libraries
+            "args": [
+                "--master_port", "25499",
+                "--nproc_per_node", "1",
+                "test.py",
+                "--version", "./weights/SIDA-7B",
+                "--dataset_dir", "./data/ff++",
+                "--vision_pretrained", "./weights/sam_vit_h_4b8939.pth"
+            ],
+        },
+        {
+            "name": "test_ffpp_no_ds_peft",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "test_nods_peft.py",
+            "console": "integratedTerminal",
+            "args": [
+                "--version", "./weights/LISA-7B-v1/",
+                "--dataset_dir=./data/ff++",
+                "--vision_pretrained=./weights/sam_vit_h_4b8939.pth",
+                "--weight", "./runs/LISA_TO_SIDA_peft_ffpp/final_checkpoint/checkpoint_9.pth",
+            ]
+        },
+        {
+            "name": "test_celebdf_no_ds",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "test_nods.py",
+            "console": "integratedTerminal",
+            "args": [
+                "--version", "./weights/SIDA-7B-Celebdf",
+                "--dataset_dir", "./data/Celeb-DF-v2",
+                "--vision_pretrained=./weights/sam_vit_h_4b8939.pth"
+            ]
+        },
+        {
+            "name": "test_celebdf_no_ds_peft",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "test_nods_peft.py",
+            "console": "integratedTerminal",
+            "args": [
+                "--version", "./weights/LISA-7B-v1/",
+                "--weight", "./runs/LISA_TO_SIDA_peft_celebdf/final_checkpoint/checkpoint_9.pth",
+                "--dataset_dir", "./data/Celeb-DF-v2",
+                "--vision_pretrained=./weights/sam_vit_h_4b8939.pth"
+            ]
+        },
+        {
+            "name": "test_ovi_no_ds",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "test_nods.py",
+            "console": "integratedTerminal",
+            "args": [
+                "--version", "./weights/SIDA-7B/",
+                "--dataset_dir", "./data/ovi",
+                "--vision_pretrained=./weights/sam_vit_h_4b8939.pth"
+            ]
+        },
+        {
+            "name": "test_liveavatar_no_ds",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "test_nods.py",
+            "console": "integratedTerminal",
+            "args": [
+                "--version", "./weights/SIDA-7B/",
+                "--dataset_dir", "./data/liveavatar",
+                "--vision_pretrained=./weights/sam_vit_h_4b8939.pth"
+            ]
+        },
+        {
+            "name": "prepare_ffpp",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "./utils/prepare_ffpp.py",
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "prepare_celebdf",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "./utils/prepare_celebdf.py",
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "prepare_ovi",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "./utils/prepare_ovi.py",
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "prepare_liveavatar",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "./utils/prepare_liveavatar.py",
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "train_ffpp_no_ds",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "train_SIDA_no_ds.py",
+            "justMyCode": false,
+            "args": [
+                "--version", "./weights/SIDA-7B",
+                "--dataset_dir", "./data/ff++",
+                "--vision_pretrained", "./weights/sam_vit_h_4b8939.pth",
+                "--val_dataset", "./data/ff++",
+                "--batch_size", "24",
+                "--exp_name", "SIDA-7B-ffpp",
+                "--epochs", "15",
+                "--steps_per_epoch", "938",
+                "--grad_accumulation_steps", "1",
+                "--lr", "0.00001",
+                "--resume", "./runs/SIDA-7B-ffpp/ckpt_model/checkpoint_12.pth"
+            ]
+        },
+        {
+            "name": "train_ffpp_no_ds_peft",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "train_SIDA_no_ds_peft.py",
+            "justMyCode": false,
+            "args": [
+                "--version", "./weights/LISA-7B-v1",
+                "--dataset_dir", "./data/ff++",
+                "--vision_pretrained", "./weights/sam_vit_h_4b8939.pth",
+                "--val_dataset", "./data/ff++",
+                "--batch_size", "24",
+                "--exp_name", "LISA_TO_SIDA_peft_ffpp",
+                "--epochs", "10",
+                "--steps_per_epoch", "938",
+                "--grad_accumulation_steps", "1",
+                "--lr", "0.0001",
+                "--resume", "./runs/LISA_TO_SIDA_peft_ffpp/ckpt_model/checkpoint_2.pth"
+            ]
+        },
+        {
+            "name": "train_celebdf_no_ds_peft",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "train_SIDA_no_ds_peft.py",
+            "justMyCode": false,
+            "args": [
+                "--version", "./weights/LISA-7B-v1",
+                "--dataset_dir", "./data/Celeb-DF-v2",
+                "--vision_pretrained", "./weights/sam_vit_h_4b8939.pth",
+                "--val_dataset", "./data/Celeb-DF-v2",
+                "--batch_size", "24",
+                "--exp_name", "LISA_TO_SIDA_peft_celebdf",
+                "--epochs", "10",
+                "--steps_per_epoch", "938",
+                "--grad_accumulation_steps", "1",
+                "--lr", "0.0001",
+            ]
+        }
+    ]
+}

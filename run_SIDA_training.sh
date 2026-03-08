@@ -1,10 +1,11 @@
 deepspeed --include localhost:1 --master_port=24999 train_SIDA.py \
-  --version="/path_to/LISA-7B-v1" \
-  --dataset_dir='/path_to/benchmark' \
-  --vision_pretrained="/path_to/sam_vit_h_4b8939.pth" \
-  --val_dataset="/path_to/benchmark/"\
-  --batch_size=2 \
+  --version="./weights/SIDA-7B" \
+  --dataset_dir='/home/peter/faigc/SIDA/data/ff++' \
+  --vision_pretrained="./weights/sam_vit_h_4b8939.pth" \
+  --val_dataset="/home/peter/faigc/SIDA/data/ff++"\
+  --batch_size=16 \
   --exp_name="SIDA-7B" \
   --epochs=10 \
-  --steps_per_epoch=1000 \
+  --steps_per_epoch=1250 \
+  --grad_accumulation_steps=1 \
   --lr=0.0001 \

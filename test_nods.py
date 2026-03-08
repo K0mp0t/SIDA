@@ -4,11 +4,7 @@ import shutil
 import sys
 import time
 from functools import partial
-
-from utils.ffpp_dataset import FFPPCustomDataset
-
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
-import deepspeed
 import numpy as np
 import torch
 import tqdm
@@ -18,6 +14,7 @@ from torch.utils.tensorboard import SummaryWriter
 from model.SIDA import SIDAForCausalLM
 from model.llava import conversation as conversation_lib
 from utils.SID_Set import collate_fn, CustomDataset
+from utils.ffpp_dataset import ffpp_collate_fn, FFPPCustomDataset
 from utils.batch_sampler import BatchSampler
 import torch.distributed as dist
 from utils.utils import (DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN,
@@ -37,7 +34,7 @@ def parse_args(args):
     parser.add_argument("--vis_save_path", default="./vis_output", type=str)
     parser.add_argument(
         "--precision",
-        default="fp16",
+        default="bf16",
         type=str,
         choices=["fp32", "bf16", "fp16"],
         help="precision for inference",
@@ -106,7 +103,6 @@ def parse_args(args):
     return parser.parse_args(args)
 def main(args):
     args = parse_args(args)
-    deepspeed.init_distributed()
     args.log_dir = os.path.join(args.log_base_dir, args.exp_name)
     if args.local_rank == 0:
         os.makedirs(args.log_dir, exist_ok=True)
@@ -123,8 +119,6 @@ def main(args):
     )
 
     tokenizer.pad_token = tokenizer.unk_token
-    num_added_token = tokenizer.add_tokens("[CLS]")
-    num_added_token = tokenizer.add_tokens("[SEG]")
     args.cls_token_idx = tokenizer("[CLS]", add_special_tokens=False).input_ids[0]
     args.seg_token_idx = tokenizer("[SEG]", add_special_tokens=False).input_ids[0]
     if args.use_mm_start_end:
@@ -179,52 +173,10 @@ def main(args):
     for p in model.get_model().mm_projector.parameters():
         p.requires_grad = False
 
-
     conversation_lib.default_conversation = conversation_lib.conv_templates[
         args.conv_type
     ]
 
-    lora_r = args.lora_r
-    if lora_r > 0:
-        def find_linear_layers(model, lora_target_modules):
-            cls = torch.nn.Linear
-            lora_module_names = set()
-            for name, module in model.named_modules():
-                if (
-                    isinstance(module, cls)
-                    and all(
-                        [
-                            x not in name
-                            for x in [
-                                "visual_model",
-                                "vision_tower",
-                                "mm_projector",
-                                "text_hidden_fcs",
-                                "cls_head",
-                                "sida_fc1",
-                                "attention_layer",
-                            ]
-                        ]
-                    )
-                    and any([x in name for x in lora_target_modules])
-                ):
-                    lora_module_names.add(name)
-            return sorted(list(lora_module_names))
-        lora_alpha = args.lora_alpha
-        lora_dropout = args.lora_dropout
-        lora_target_modules = find_linear_layers(
-                model, args.lora_target_modules.split(",")
-        )
-        lora_config = LoraConfig(
-            r=lora_r,
-            lora_alpha=lora_alpha,
-            target_modules=lora_target_modules,
-            lora_dropout=lora_dropout,
-            bias="none",
-            task_type="CAUSAL_LM",
-        )
-        model = get_peft_model(model, lora_config)
-        model.print_trainable_parameters()
     model.resize_token_embeddings(len(tokenizer))
 
     for n, p in model.named_parameters():
@@ -240,317 +192,45 @@ def main(args):
         ):
             p.requires_grad = True
 
-    print("Checking trainable parameters:")
+    # print("Checking trainable parameters:")
     total_params = 0
     for n, p in model.named_parameters():
         if p.requires_grad:
-            print(f"Trainable: {n} with {p.numel()} parameters")
+            # print(f"Trainable: {n} with {p.numel()} parameters")
             total_params += p.numel()
     print(f"Total trainable parameters: {total_params}")
 
     world_size = torch.cuda.device_count()
     args.distributed = world_size > 1
-    train_dataset = CustomDataset(
-        base_image_dir=args.dataset_dir,  
+
+    test_dataset = CustomDataset(
+        base_image_dir=args.dataset_dir,
         tokenizer=tokenizer,
-        vision_tower=args.vision_tower,
-        split="train",
-        precision=args.precision,
-        image_size=args.image_size,
+        vision_tower=args.vision_tower,  
+        split="test", 
+        precision=args.precision, 
+        image_size=args.image_size, 
     )
-    print(f"\nInitializing datasets:")
-    print(f"Training split size: {len(train_dataset)}")
+    print('Number of samples to test on:', len(test_dataset))
 
-    if args.no_test == False:
-        test_dataset = CustomDataset(
-            base_image_dir=args.dataset_dir, 
-            tokenizer=tokenizer,
-            vision_tower=args.vision_tower,
-            split="test",
-            precision=args.precision,
-            image_size=args.image_size,
-        )
-        print(
-            f"Training with {len(train_dataset)} examples and testing with {len(test_dataset)} examples."
-        )
-    else:
-        test_dataset = None
-        print(f"Training with {len(train_dataset)} examples.")
-    ds_config = {
-        "train_micro_batch_size_per_gpu": args.batch_size,
-        "gradient_accumulation_steps": args.grad_accumulation_steps,
-        "optimizer": {
-            "type": "AdamW",
-            "params": {
-                "lr": args.lr,
-                "weight_decay": 0.0,
-                "betas": (args.beta1, args.beta2),
-            },
-        },
-        "scheduler": {
-            "type": "WarmupDecayLR",
-            "params": {
-                "total_num_steps": args.epochs * args.steps_per_epoch,
-                "warmup_min_lr": 0,
-                "warmup_max_lr": args.lr,
-                "warmup_num_steps": 100,
-                "warmup_type": "linear",
-            },
-        },
-        "fp16": {
-            "enabled": args.precision == "fp16",
-            "loss_scale": 0,  
-            "initial_scale_power": 12,  
-            "loss_scale_window": 1000,
-            "min_loss_scale": 1,
-            "hysteresis": 2
-        },
-        "gradient_clipping": 1.0,
-        "bf16": {
-            "enabled": args.precision == "bf16",
-        },
-        "gradient_clipping": 1.0,
-        "zero_optimization": {
-            "stage": 2,
-            "contiguous_gradients": True,
-            "overlap_comm": True,
-            "reduce_scatter": True,
-            "reduce_bucket_size": 5e8,
-            "allgather_bucket_size": 5e8,
-        },
-    }
-    batch_sampler = BatchSampler(
-        dataset=train_dataset,
-        batch_size=ds_config["train_micro_batch_size_per_gpu"],
-        world_size=torch.cuda.device_count(),
-        rank=args.local_rank
-    )
-
-    train_loader = torch.utils.data.DataLoader(
-        train_dataset,
-        batch_sampler=batch_sampler,
+    test_loader = torch.utils.data.DataLoader(
+        test_dataset,
+        batch_size=args.test_batch_size,
         num_workers=args.workers,
         pin_memory=True,
         collate_fn=partial(
-            collate_fn,
-            tokenizer=tokenizer,
-            conv_type=args.conv_type,
-            use_mm_start_end=args.use_mm_start_end,
-            local_rank=args.local_rank,
-            cls_token_idx=args.cls_token_idx,
-        ),
-    )
-    model_engine, optimizer, _, scheduler = deepspeed.initialize(
-        model=model,
-        model_parameters=model.parameters(),
-        config=ds_config,
-        training_data=None, 
+                collate_fn,
+                tokenizer=tokenizer,
+                conv_type=args.conv_type,
+                use_mm_start_end=args.use_mm_start_end,
+                local_rank=args.local_rank,
+            ),
     )
 
-    if args.auto_resume and len(args.resume) == 0:
-        resume = os.path.join(args.log_dir,  "ckpt_model")
-        if os.path.exists(resume):
-            args.resume = resume
+    model = model.to(torch_dtype).to('cuda:0')
 
-    if args.resume:
-        load_path, client_state = model_engine.load_checkpoint(args.resume)
-        with open(os.path.join(args.resume, "latest"), "r") as f:
-            ckpt_dir = f.readlines()[0].strip()
-        args.start_epoch = (
-            int(ckpt_dir.replace("global_step", "")) // args.steps_per_epoch
-        )
-        print(
-            "resume training from {}, start from epoch {}".format(
-                args.resume, args.start_epoch
-            )
-        )
+    test(test_loader, model, 0, writer, args) 
 
-    if test_dataset is not None:
-        test_sampler = BatchSampler(
-            dataset=test_dataset,
-            batch_size=args.test_batch_size,
-            world_size=torch.cuda.device_count(),
-            rank=args.local_rank
-        )
-        test_loader = torch.utils.data.DataLoader(
-            test_dataset,
-            batch_sampler=test_sampler,
-            num_workers=args.workers,
-            pin_memory=True,
-            collate_fn=partial(
-                 collate_fn,
-                 tokenizer=tokenizer,
-                 conv_type=args.conv_type,
-                 use_mm_start_end=args.use_mm_start_end,
-                 local_rank=args.local_rank,
-             ),
-        )
-
-    train_iter = iter(train_loader)
-
-    best_acc, best_score, cur_ciou = 0.0, 0.0, 0.0
-
-    if args.test_only:
-        acc, giou, ciou, _ = test(test_loader, model_engine, 0, writer, args) 
-        exit()
-
-    test_epochs = [1,3,5,7,10]
-    if args.local_rank == 0:
-        print(f"\nTraining Configuration:")
-        print(f"Total epochs: {args.epochs}")
-        print(f"test will be performed after epochs: {test_epochs}")
-    for epoch in range(args.start_epoch, args.epochs):
-        # train for one epoch
-        train_iter = train(
-            train_loader,
-            model_engine,
-            epoch,
-            scheduler,
-            writer,
-            train_iter,
-            args,
-        )
-        if (epoch + 1) in test_epochs: 
-            if args.local_rank == 0:
-                print(f"\nPerforming test after epoch {epoch + 1}")
-
-            if args.no_test == False:
-                acc, giou, ciou, _ = test(test_loader, model_engine, epoch, writer, args)
-                best_score = max(giou, best_score)
-                is_best_iou = giou > best_score
-                cur_ciou = ciou if is_best_iou else cur_ciou
-                is_best_acc = acc > best_acc
-                best_acc = max(acc, best_acc)
-                cur_acc = acc if is_best_acc else cur_acc
-                is_best = is_best_iou or is_best_acc
-
-            if args.local_rank == 0:
-                print(f"Current accuracy: {acc:.2f}%, Best accuracy: {best_acc:.2f}%")
-                print(f"Current iou: {cur_ciou:.2f}%, Best score: {best_score:.2f}%")
-            if args.no_test or is_best:
-                save_dir = os.path.join(args.log_dir, "ckpt_model")
-                if args.local_rank == 0:
-                    torch.save(
-                                {"epoch": epoch},
-                                os.path.join(
-                                    args.log_dir,
-                                    f"meta_log_acc{best_acc:.3f}_iou{best_score:.3f}.pth"
-                                ),
-                    )
-                    if os.path.exists(save_dir):
-                        shutil.rmtree(save_dir)
-                torch.distributed.barrier()
-                model_engine.save_checkpoint(save_dir)
-        else:
-            if args.local_rank == 0:
-                print(f"Epoch {epoch + 1} completed. Skipping test.")
-
-        if epoch == args.epochs - 1:
-            save_dir = os.path.join(args.log_dir, "final_checkpoint")
-            if args.local_rank == 0:
-                if os.path.exists(save_dir):
-                    shutil.rmtree(save_dir)
-            torch.distributed.barrier()
-            model_engine.save_checkpoint(save_dir)
-            if args.local_rank == 0:
-                print(f"\nTraining completed. Final checkpoint saved to {save_dir}")
-
-def train(
-    train_loader,
-    model,
-    epoch,
-    scheduler,
-    writer,
-    train_iter,
-    args,
-):
-    """Main training loop."""
-    batch_time = AverageMeter("Time", ":6.3f")
-    data_time = AverageMeter("Data", ":6.3f")
-    losses = AverageMeter("Loss", ":.4f")
-    cls_losses = AverageMeter("ClsLoss", ":.4f")
-    mask_bce_losses = AverageMeter("MaskBCELoss", ":.4f")
-    mask_dice_losses = AverageMeter("MaskDICELoss", ":.4f")
-    mask_losses = AverageMeter("MaskLoss", ":.4f")
-    progress = ProgressMeter(
-        args.steps_per_epoch,
-        [batch_time, losses, cls_losses, mask_bce_losses, mask_dice_losses, mask_losses],
-        prefix="Epoch: [{}]".format(epoch),
-    )
-    model.train()
-    end = time.time()
-    for global_step in range(args.steps_per_epoch):
-        model.zero_grad()
-        for i in range(args.grad_accumulation_steps):
-            try:
-                input_dict = next(train_iter)
-            except:
-                train_iter = iter(train_loader)
-                input_dict = next(train_iter)
-
-            data_time.update(time.time() - end)
-            input_dict = dict_to_cuda(input_dict)
-            if args.precision == "fp16":
-                input_dict["images"] = input_dict["images"].half()
-                input_dict["images_clip"] = input_dict["images_clip"].half()
-            elif args.precision == "bf16":
-                input_dict["images"] = input_dict["images"].bfloat16()
-                input_dict["images_clip"] = input_dict["images_clip"].bfloat16()
-            else:
-                input_dict["images"] = input_dict["images"].float()
-                input_dict["images_clip"] = input_dict["images_clip"].float()
-            output_dict = model(**input_dict)
-            loss = output_dict["loss"]
-            cls_loss = output_dict["cls_loss"]
-            mask_bce_loss = output_dict["mask_bce_loss"]
-            mask_dice_loss = output_dict["mask_dice_loss"]
-            mask_loss = output_dict["mask_loss"]
-            losses.update(loss.item(), input_dict["images"].size(0))
-            cls_losses.update(cls_loss.item(), input_dict["images"].size(0))
-            if input_dict['cls_labels'][0] == 2:
-                mask_bce_losses.update(mask_bce_loss.item(), input_dict["images"].size(0))
-                mask_dice_losses.update(mask_dice_loss.item(), input_dict["images"].size(0))
-                mask_losses.update(mask_loss.item(), input_dict["images"].size(0))
-            model.backward(loss)
-            model.step()
-
-        batch_time.update(time.time() - end)
-        end = time.time()
-
-        if global_step % args.print_freq == 0:
-            if args.distributed:
-                batch_time.all_reduce()
-                data_time.all_reduce()
-                losses.all_reduce()
-                cls_losses.all_reduce()
-                mask_bce_losses.all_reduce()
-                mask_dice_losses.all_reduce()
-                mask_losses.all_reduce()
-
-            if args.local_rank == 0:
-                progress.display(global_step + 1)
-                writer.add_scalar("train/loss", losses.avg, global_step)
-                writer.add_scalar("train/cls_loss", cls_losses.avg, global_step)
-                writer.add_scalar("train/mask_bce_loss", mask_bce_losses.avg, global_step)
-                writer.add_scalar("train/mask_dice_loss", mask_dice_losses.avg, global_step)
-                writer.add_scalar("train/mask_loss", mask_losses.avg, global_step)
-                writer.add_scalar("metrics/total_secs_per_batch", batch_time.avg, global_step)
-                writer.add_scalar("metrics/data_secs_per_batch", data_time.avg, global_step)
-            batch_time.reset()
-            data_time.reset()
-            losses.reset()
-            cls_losses.reset()
-            mask_bce_losses.reset()
-            mask_dice_losses.reset()
-            mask_losses.reset()
-
-        if global_step != 0:
-            curr_lr = scheduler.get_last_lr()
-            if args.local_rank == 0:
-                writer.add_scalar("train/lr", curr_lr[0], global_step)
-
-    return train_iter
-import random
 
 def test(test_loader, model_engine, epoch, writer, args, sample_ratio=None):
     model_engine.eval()
@@ -574,21 +254,9 @@ def test(test_loader, model_engine, epoch, writer, args, sample_ratio=None):
         # Skip batches not in our sample if sampling is enabled
         if sample_ratio is not None and batch_idx not in sample_indices:
             continue
-        if batch_idx == 0:
-            print("\nFirst test batch details:")
-            for key, value in input_dict.items():
-                if isinstance(value, torch.Tensor):
-                    print(f"{key} shape: {value.shape}")
-                elif isinstance(value, list):
-                    print(f"{key} length: {len(value)}")
 
         torch.cuda.empty_cache()
         input_dict = dict_to_cuda(input_dict)
-
-        # Debug first processed batch
-        if total == 0:
-            print("\nProcessing first batch:")
-            print("Input dict keys:", input_dict.keys())
 
         if args.precision == "fp16":
             input_dict["images"] = input_dict["images"].half()
@@ -634,14 +302,9 @@ def test(test_loader, model_engine, epoch, writer, args, sample_ratio=None):
             union_meter.update(union)
             acc_iou_meter.update(acc_iou, n=masks_list.shape[0])
 
-    intersection_meter.all_reduce()
-    union_meter.all_reduce()
-    acc_iou_meter.all_reduce()
-
     iou_class = intersection_meter.sum / (union_meter.sum + 1e-10)
-    ciou = iou_class[1] if len(iou_class) > 1 else 0.0
-    giou = acc_iou_meter.avg[1] if len(acc_iou_meter.avg) > 1 else 0.0
-
+    ciou = iou_class[1] if hasattr(iou_class, 'len') and len(iou_class) > 1 else 0.0
+    giou = acc_iou_meter.avg[1] if hasattr(acc_iou_meter.avg, 'len') and len(acc_iou_meter.avg) > 1 else 0.0
     accuracy = correct / total * 100.0
     confusion_matrix = confusion_matrix.cpu()
     class_names = ['Real', 'Full Synthetic', 'Tampered']
@@ -666,12 +329,11 @@ def test(test_loader, model_engine, epoch, writer, args, sample_ratio=None):
             'f1': f1
         }
 
-
-    pixel_correct = intersection_meter.sum[1]  
-    pixel_total = union_meter.sum[1]  
+    pixel_correct = intersection_meter.sum[1] if hasattr(intersection_meter.sum, 'len') and len(intersection_meter.sum) > 1 else 0.0
+    pixel_total = union_meter.sum[1] if hasattr(union_meter.sum, 'len') and len(union_meter.sum) > 1 else 0.0
     pixel_accuracy = pixel_correct / (pixel_total + 1e-10) * 100.0
 
-    iou = ciou  
+    iou = ciou
     f1_score = 2 * (iou * accuracy / 100) / (iou + accuracy / 100 + 1e-10) if (iou + accuracy / 100) > 0 else 0.0
 
     avg_precision = np.mean([metrics['precision'] for metrics in per_class_metrics.values()])

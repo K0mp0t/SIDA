@@ -4,11 +4,7 @@ import shutil
 import sys
 import time
 from functools import partial
-
-from utils.ffpp_dataset import FFPPCustomDataset
-
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
-import deepspeed
 import numpy as np
 import torch
 import tqdm
@@ -30,14 +26,13 @@ warnings.filterwarnings("ignore")
 
 def parse_args(args):
     parser = argparse.ArgumentParser(description="SIDA Model Training")
-    parser.add_argument("--local_rank", default=0, type=int, help="node rank")
     parser.add_argument(
         "--version", default="liuhaotian/llava-llama-2-13b-chat-lightning-preview"
     )
     parser.add_argument("--vis_save_path", default="./vis_output", type=str)
     parser.add_argument(
         "--precision",
-        default="fp16",
+        default="bf16",
         type=str,
         choices=["fp32", "bf16", "fp16"],
         help="precision for inference",
@@ -51,7 +46,7 @@ def parse_args(args):
     parser.add_argument("--load_in_8bit", action="store_true", default=False)
     parser.add_argument("--load_in_4bit", action="store_true", default=False)
 
-    parser.add_argument("--test_dataset", default="test", type=str)
+    parser.add_argument("--val_dataset", default="val", type=str)
     parser.add_argument("--dataset_dir", default="./dataset", type=str)
     parser.add_argument("--log_base_dir", default="./runs", type=str)
     parser.add_argument("--exp_name", default="sida", type=str)
@@ -65,10 +60,11 @@ def parse_args(args):
         default=10,
         type=int,
     )
-    parser.add_argument("--test_batch_size", default=1, type=int)
+    parser.add_argument("--val_batch_size", default=1, type=int)
     parser.add_argument("--workers", default=4, type=int)
     parser.add_argument("--lr", default=0.00001, type=float)
 
+    # Add Stage-specific arguments
     parser.add_argument("--num_classes", type=int, default=3,
                        help="Number of classes for classification in stage 1")
     parser.add_argument("--use_stage1_cls", action="store_true", default=True,
@@ -85,8 +81,9 @@ def parse_args(args):
     parser.add_argument("--beta1", default=0.9, type=float)
     parser.add_argument("--beta2", default=0.95, type=float)
     parser.add_argument("--num_classes_per_sample", default=3, type=int)
-    parser.add_argument("--no_test", action="store_true", default=False)
-    parser.add_argument("--test_only", action="store_true", default=False)
+    parser.add_argument("--exclude_val", action="store_true", default=False)
+    parser.add_argument("--no_eval", action="store_true", default=False)
+    parser.add_argument("--eval_only", action="store_true", default=False)
     parser.add_argument("--vision_pretrained", default="PATH_TO_SAM_ViT-H", type=str)
     parser.add_argument("--out_dim", default=256, type=int)
     parser.add_argument("--resume", default="", type=str)
@@ -106,14 +103,11 @@ def parse_args(args):
     return parser.parse_args(args)
 def main(args):
     args = parse_args(args)
-    deepspeed.init_distributed()
     args.log_dir = os.path.join(args.log_base_dir, args.exp_name)
-    if args.local_rank == 0:
-        os.makedirs(args.log_dir, exist_ok=True)
-        writer = SummaryWriter(args.log_dir)
-    else:
-        writer = None
+    os.makedirs(args.log_dir, exist_ok=True)
+    writer = SummaryWriter(args.log_dir)
 
+     # Create model
     tokenizer = transformers.AutoTokenizer.from_pretrained(
         args.version,
         cache_dir=None,
@@ -169,8 +163,8 @@ def main(args):
     model.gradient_checkpointing_enable()
     model.get_model().initialize_vision_modules(model.get_model().config)
     vision_tower = model.get_model().get_vision_tower()
-    vision_tower.to(dtype=torch_dtype, device=args.local_rank)
-    if not args.test_only:
+    vision_tower.to(dtype=torch_dtype, device='cuda:0')
+    if not args.eval_only:
         model.get_model().initialize_sida_modules(model.get_model().config)
 
     for p in vision_tower.parameters():
@@ -244,91 +238,42 @@ def main(args):
     total_params = 0
     for n, p in model.named_parameters():
         if p.requires_grad:
-            print(f"Trainable: {n} with {p.numel()} parameters")
+            # print(f"Trainable: {n} with {p.numel()} parameters")
             total_params += p.numel()
     print(f"Total trainable parameters: {total_params}")
 
-    world_size = torch.cuda.device_count()
-    args.distributed = world_size > 1
     train_dataset = CustomDataset(
-        base_image_dir=args.dataset_dir,  
+        base_image_dir=args.dataset_dir,  # Root directory containing image data
         tokenizer=tokenizer,
-        vision_tower=args.vision_tower,
-        split="train",
-        precision=args.precision,
-        image_size=args.image_size,
+        vision_tower=args.vision_tower,  # Vision model used for pre-processing (e.g., CLIP)
+        split="train",  # Specify that this is the training split
+        precision=args.precision,  # Precision for image processing
+        image_size=args.image_size,  # Image size for resizing
+
     )
     print(f"\nInitializing datasets:")
     print(f"Training split size: {len(train_dataset)}")
 
-    if args.no_test == False:
-        test_dataset = CustomDataset(
-            base_image_dir=args.dataset_dir, 
+    if args.no_eval == False:
+        val_dataset = CustomDataset(
+            base_image_dir=args.dataset_dir,  # Root directory containing image data
             tokenizer=tokenizer,
-            vision_tower=args.vision_tower,
-            split="test",
-            precision=args.precision,
-            image_size=args.image_size,
-        )
+            vision_tower=args.vision_tower,  # Vision model used for pre-processing (e.g., CLIP)
+            split="validation",  # Specify that this is the training split
+            precision=args.precision,  # Precision for image processing
+            image_size=args.image_size,  # Image size for resizing
+    )
         print(
-            f"Training with {len(train_dataset)} examples and testing with {len(test_dataset)} examples."
+            f"Training with {len(train_dataset)} examples and validating with {len(val_dataset)} examples."
         )
     else:
-        test_dataset = None
+        val_dataset = None
         print(f"Training with {len(train_dataset)} examples.")
-    ds_config = {
-        "train_micro_batch_size_per_gpu": args.batch_size,
-        "gradient_accumulation_steps": args.grad_accumulation_steps,
-        "optimizer": {
-            "type": "AdamW",
-            "params": {
-                "lr": args.lr,
-                "weight_decay": 0.0,
-                "betas": (args.beta1, args.beta2),
-            },
-        },
-        "scheduler": {
-            "type": "WarmupDecayLR",
-            "params": {
-                "total_num_steps": args.epochs * args.steps_per_epoch,
-                "warmup_min_lr": 0,
-                "warmup_max_lr": args.lr,
-                "warmup_num_steps": 100,
-                "warmup_type": "linear",
-            },
-        },
-        "fp16": {
-            "enabled": args.precision == "fp16",
-            "loss_scale": 0,  
-            "initial_scale_power": 12,  
-            "loss_scale_window": 1000,
-            "min_loss_scale": 1,
-            "hysteresis": 2
-        },
-        "gradient_clipping": 1.0,
-        "bf16": {
-            "enabled": args.precision == "bf16",
-        },
-        "gradient_clipping": 1.0,
-        "zero_optimization": {
-            "stage": 2,
-            "contiguous_gradients": True,
-            "overlap_comm": True,
-            "reduce_scatter": True,
-            "reduce_bucket_size": 5e8,
-            "allgather_bucket_size": 5e8,
-        },
-    }
-    batch_sampler = BatchSampler(
-        dataset=train_dataset,
-        batch_size=ds_config["train_micro_batch_size_per_gpu"],
-        world_size=torch.cuda.device_count(),
-        rank=args.local_rank
-    )
 
+    # Create DataLoader with BatchSampler
     train_loader = torch.utils.data.DataLoader(
         train_dataset,
-        batch_sampler=batch_sampler,
+        batch_size=args.batch_size,
         num_workers=args.workers,
         pin_memory=True,
         collate_fn=partial(
@@ -336,53 +281,40 @@ def main(args):
             tokenizer=tokenizer,
             conv_type=args.conv_type,
             use_mm_start_end=args.use_mm_start_end,
-            local_rank=args.local_rank,
             cls_token_idx=args.cls_token_idx,
         ),
-    )
-    model_engine, optimizer, _, scheduler = deepspeed.initialize(
-        model=model,
-        model_parameters=model.parameters(),
-        config=ds_config,
-        training_data=None, 
+        shuffle=True,
     )
 
     if args.auto_resume and len(args.resume) == 0:
-        resume = os.path.join(args.log_dir,  "ckpt_model")
-        if os.path.exists(resume):
+        resume_dir = os.path.join(args.log_dir,  "ckpt_model")
+        if os.path.exists(resume_dir):
+            last_ckpt_fn = max(os.listdir(resume_dir), key=lambda f: int(f.split('.')[0].split('_')[1]))
+            resume = os.path.join(resume_dir, last_ckpt_fn)
             args.resume = resume
 
     if args.resume:
-        load_path, client_state = model_engine.load_checkpoint(args.resume)
-        with open(os.path.join(args.resume, "latest"), "r") as f:
-            ckpt_dir = f.readlines()[0].strip()
-        args.start_epoch = (
-            int(ckpt_dir.replace("global_step", "")) // args.steps_per_epoch
-        )
+        # load_path, client_state = model.load_checkpoint(args.resume)
+        model.load_state_dict(torch.load(args.resume))
+        args.start_epoch = int(os.path.basename(args.resume).split('.')[0].split('_')[1]) + 1
         print(
             "resume training from {}, start from epoch {}".format(
                 args.resume, args.start_epoch
             )
         )
 
-    if test_dataset is not None:
-        test_sampler = BatchSampler(
-            dataset=test_dataset,
-            batch_size=args.test_batch_size,
-            world_size=torch.cuda.device_count(),
-            rank=args.local_rank
-        )
-        test_loader = torch.utils.data.DataLoader(
-            test_dataset,
-            batch_sampler=test_sampler,
+    # validation dataset
+    if val_dataset is not None:
+        val_loader = torch.utils.data.DataLoader(
+            val_dataset,
+            batch_size=args.val_batch_size,
             num_workers=args.workers,
             pin_memory=True,
             collate_fn=partial(
                  collate_fn,
                  tokenizer=tokenizer,
                  conv_type=args.conv_type,
-                 use_mm_start_end=args.use_mm_start_end,
-                 local_rank=args.local_rank,
+                 use_mm_start_end=args.use_mm_start_end
              ),
         )
 
@@ -390,32 +322,38 @@ def main(args):
 
     best_acc, best_score, cur_ciou = 0.0, 0.0, 0.0
 
-    if args.test_only:
-        acc, giou, ciou, _ = test(test_loader, model_engine, 0, writer, args) 
+    if args.eval_only:
+        acc, giou, ciou, _ = validate(val_loader, model, 0, writer, args)  # Classification validation
         exit()
 
-    test_epochs = [1,3,5,7,10]
-    if args.local_rank == 0:
-        print(f"\nTraining Configuration:")
-        print(f"Total epochs: {args.epochs}")
-        print(f"test will be performed after epochs: {test_epochs}")
+    model.to(torch_dtype).to('cuda:0')
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    warmup_steps = args.epochs * args.steps_per_epoch * 0.05
+    warmup_scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.1, end_factor=1.0, total_iters=warmup_steps)
+    regular_scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.9998)
+    scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer, [warmup_scheduler, regular_scheduler], milestones=[warmup_steps])
+
+    validation_epochs = [1,3,5,7,10]
+    print(f"\nTraining Configuration:")
+    print(f"Total epochs: {args.epochs}")
+    print(f"Validation will be performed after epochs: {validation_epochs}")
     for epoch in range(args.start_epoch, args.epochs):
         # train for one epoch
         train_iter = train(
             train_loader,
-            model_engine,
+            model,
             epoch,
+            optimizer,
             scheduler,
             writer,
             train_iter,
             args,
         )
-        if (epoch + 1) in test_epochs: 
-            if args.local_rank == 0:
-                print(f"\nPerforming test after epoch {epoch + 1}")
+        if (epoch + 1) in validation_epochs:  # +1 because epoch starts from 0
+            print(f"\nPerforming validation after epoch {epoch + 1}")
 
-            if args.no_test == False:
-                acc, giou, ciou, _ = test(test_loader, model_engine, epoch, writer, args)
+            if args.no_eval == False:
+                acc, giou, ciou, _ = validate(val_loader, model, epoch, writer, args)
                 best_score = max(giou, best_score)
                 is_best_iou = giou > best_score
                 cur_ciou = ciou if is_best_iou else cur_ciou
@@ -424,41 +362,38 @@ def main(args):
                 cur_acc = acc if is_best_acc else cur_acc
                 is_best = is_best_iou or is_best_acc
 
-            if args.local_rank == 0:
-                print(f"Current accuracy: {acc:.2f}%, Best accuracy: {best_acc:.2f}%")
-                print(f"Current iou: {cur_ciou:.2f}%, Best score: {best_score:.2f}%")
-            if args.no_test or is_best:
+            print(f"Current accuracy: {acc:.2f}%, Best accuracy: {best_acc:.2f}%")
+            print(f"Current iou: {cur_ciou:.2f}%, Best score: {best_score:.2f}%")
+            # Save checkpoints for best performance
+            if args.no_eval or is_best:
                 save_dir = os.path.join(args.log_dir, "ckpt_model")
-                if args.local_rank == 0:
-                    torch.save(
-                                {"epoch": epoch},
-                                os.path.join(
-                                    args.log_dir,
-                                    f"meta_log_acc{best_acc:.3f}_iou{best_score:.3f}.pth"
-                                ),
-                    )
-                    if os.path.exists(save_dir):
-                        shutil.rmtree(save_dir)
-                torch.distributed.barrier()
-                model_engine.save_checkpoint(save_dir)
-        else:
-            if args.local_rank == 0:
-                print(f"Epoch {epoch + 1} completed. Skipping test.")
-
-        if epoch == args.epochs - 1:
-            save_dir = os.path.join(args.log_dir, "final_checkpoint")
-            if args.local_rank == 0:
+                torch.save(
+                            {"epoch": epoch},
+                            os.path.join(
+                                args.log_dir,
+                                f"meta_log_acc{best_acc:.3f}_iou{best_score:.3f}.pth"
+                            ),
+                )
                 if os.path.exists(save_dir):
                     shutil.rmtree(save_dir)
-            torch.distributed.barrier()
-            model_engine.save_checkpoint(save_dir)
-            if args.local_rank == 0:
-                print(f"\nTraining completed. Final checkpoint saved to {save_dir}")
+                os.makedirs(save_dir, exist_ok=True)
+                torch.save(model.state_dict(), os.path.join(save_dir, f'checkpoint_{epoch}.pth'))
+        else:
+            print(f"Epoch {epoch + 1} completed. Skipping validation.")
+
+        # Save final epoch regardless of validation
+        if epoch == args.epochs - 1:
+            save_dir = os.path.join(args.log_dir, "final_checkpoint")
+            if os.path.exists(save_dir):
+                shutil.rmtree(save_dir)
+            os.makedirs(save_dir, exist_ok=True)
+            torch.save(model.state_dict(), os.path.join(save_dir, f'checkpoint_{epoch}.pth'))
 
 def train(
     train_loader,
     model,
     epoch,
+    optimizer,
     scheduler,
     writer,
     train_iter,
@@ -480,7 +415,7 @@ def train(
     model.train()
     end = time.time()
     for global_step in range(args.steps_per_epoch):
-        model.zero_grad()
+        optimizer.zero_grad()
         for i in range(args.grad_accumulation_steps):
             try:
                 input_dict = next(train_iter)
@@ -511,31 +446,22 @@ def train(
                 mask_bce_losses.update(mask_bce_loss.item(), input_dict["images"].size(0))
                 mask_dice_losses.update(mask_dice_loss.item(), input_dict["images"].size(0))
                 mask_losses.update(mask_loss.item(), input_dict["images"].size(0))
-            model.backward(loss)
-            model.step()
+        loss.backward()
+        optimizer.step()
+        scheduler.step()
 
         batch_time.update(time.time() - end)
         end = time.time()
 
         if global_step % args.print_freq == 0:
-            if args.distributed:
-                batch_time.all_reduce()
-                data_time.all_reduce()
-                losses.all_reduce()
-                cls_losses.all_reduce()
-                mask_bce_losses.all_reduce()
-                mask_dice_losses.all_reduce()
-                mask_losses.all_reduce()
-
-            if args.local_rank == 0:
-                progress.display(global_step + 1)
-                writer.add_scalar("train/loss", losses.avg, global_step)
-                writer.add_scalar("train/cls_loss", cls_losses.avg, global_step)
-                writer.add_scalar("train/mask_bce_loss", mask_bce_losses.avg, global_step)
-                writer.add_scalar("train/mask_dice_loss", mask_dice_losses.avg, global_step)
-                writer.add_scalar("train/mask_loss", mask_losses.avg, global_step)
-                writer.add_scalar("metrics/total_secs_per_batch", batch_time.avg, global_step)
-                writer.add_scalar("metrics/data_secs_per_batch", data_time.avg, global_step)
+            progress.display(global_step + 1)
+            writer.add_scalar("train/loss", losses.avg, global_step)
+            writer.add_scalar("train/cls_loss", cls_losses.avg, global_step)
+            writer.add_scalar("train/mask_bce_loss", mask_bce_losses.avg, global_step)
+            writer.add_scalar("train/mask_dice_loss", mask_dice_losses.avg, global_step)
+            writer.add_scalar("train/mask_loss", mask_losses.avg, global_step)
+            writer.add_scalar("metrics/total_secs_per_batch", batch_time.avg, global_step)
+            writer.add_scalar("metrics/data_secs_per_batch", data_time.avg, global_step)
             batch_time.reset()
             data_time.reset()
             losses.reset()
@@ -546,13 +472,17 @@ def train(
 
         if global_step != 0:
             curr_lr = scheduler.get_last_lr()
-            if args.local_rank == 0:
-                writer.add_scalar("train/lr", curr_lr[0], global_step)
+            writer.add_scalar("train/lr", curr_lr[0], global_step)
 
     return train_iter
 import random
 
-def test(test_loader, model_engine, epoch, writer, args, sample_ratio=None):
+def validate(val_loader, model_engine, epoch, writer, args, sample_ratio=None):
+    """
+    Validate the model with option for random sampling
+    Args:
+        sample_ratio: if None, use all data; if float (e.g., 0.1), randomly sample that portion
+    """
     model_engine.eval()
     correct = 0
     total = 0
@@ -563,19 +493,19 @@ def test(test_loader, model_engine, epoch, writer, args, sample_ratio=None):
     acc_iou_meter = AverageMeter("gIoU", ":6.3f", Summary.SUM)
 
     # Calculate total number of batches and samples to use
-    total_batches = len(test_loader)
+    total_batches = len(val_loader)
     if sample_ratio is not None:
         num_batches = max(1, int(total_batches * sample_ratio))
         # Generate random indices for sampling
         sample_indices = set(random.sample(range(total_batches), num_batches))
-        print(f"\ntest on {num_batches}/{total_batches} randomly sampled batches...")
+        print(f"\nValidating on {num_batches}/{total_batches} randomly sampled batches...")
 
-    for batch_idx, input_dict in enumerate(tqdm.tqdm(test_loader)):
+    for batch_idx, input_dict in enumerate(tqdm.tqdm(val_loader)):
         # Skip batches not in our sample if sampling is enabled
         if sample_ratio is not None and batch_idx not in sample_indices:
             continue
         if batch_idx == 0:
-            print("\nFirst test batch details:")
+            print("\nFirst validation batch details:")
             for key, value in input_dict.items():
                 if isinstance(value, torch.Tensor):
                     print(f"{key} shape: {value.shape}")
@@ -613,6 +543,8 @@ def test(test_loader, model_engine, epoch, writer, args, sample_ratio=None):
 
         for t, p in zip(cls_labels, preds):
             confusion_matrix[t.long(), p.long()] += 1
+        # Debug first batch predictions
+        # Segmentation validation (only for "object/part synthetic" images, cls_label == 2)
         if cls_labels[0] == 2:
             pred_masks = output_dict["pred_masks"]
             masks_list = output_dict["gt_masks"][0].int()
@@ -634,26 +566,25 @@ def test(test_loader, model_engine, epoch, writer, args, sample_ratio=None):
             union_meter.update(union)
             acc_iou_meter.update(acc_iou, n=masks_list.shape[0])
 
-    intersection_meter.all_reduce()
-    union_meter.all_reduce()
-    acc_iou_meter.all_reduce()
-
     iou_class = intersection_meter.sum / (union_meter.sum + 1e-10)
     ciou = iou_class[1] if len(iou_class) > 1 else 0.0
     giou = acc_iou_meter.avg[1] if len(acc_iou_meter.avg) > 1 else 0.0
 
+    # Calculate classification accuracy
     accuracy = correct / total * 100.0
     confusion_matrix = confusion_matrix.cpu()
     class_names = ['Real', 'Full Synthetic', 'Tampered']
     per_class_metrics = {}
     for i in range(num_classes):
-        tp = confusion_matrix[i, i]  
-        fp = confusion_matrix[:, i].sum() - tp  
-        fn = confusion_matrix[i, :].sum() - tp 
-        tn = confusion_matrix.sum() - (tp + fp + fn)  
+        tp = confusion_matrix[i, i]  # Diagonal elements are true positives
+        fp = confusion_matrix[:, i].sum() - tp  # Column sum minus TP = false positives
+        fn = confusion_matrix[i, :].sum() - tp  # Row sum minus TP = false negatives
+        tn = confusion_matrix.sum() - (tp + fp + fn)  # Rest are true negatives
 
+        # Total samples of this class (row sum)
         total_class_samples = confusion_matrix[i, :].sum()
 
+        # Metrics calculations
         class_accuracy = float(tp / total_class_samples) if total_class_samples > 0 else 0.0
         precision = float(tp / (tp + fp)) if (tp + fp) > 0 else 0.0
         recall = float(tp / (tp + fn)) if (tp + fn) > 0 else 0.0
@@ -666,62 +597,64 @@ def test(test_loader, model_engine, epoch, writer, args, sample_ratio=None):
             'f1': f1
         }
 
-
-    pixel_correct = intersection_meter.sum[1]  
-    pixel_total = union_meter.sum[1]  
+    # Calculate pixel accuracy
+    pixel_correct = intersection_meter.sum[1]  # Correctly classified pixels (excluding background)
+    pixel_total = union_meter.sum[1]  # Total pixels (excluding background)
     pixel_accuracy = pixel_correct / (pixel_total + 1e-10) * 100.0
 
-    iou = ciou  
+    iou = ciou  # Use ciou as the IoU for the foreground class
     f1_score = 2 * (iou * accuracy / 100) / (iou + accuracy / 100 + 1e-10) if (iou + accuracy / 100) > 0 else 0.0
 
+    # Calculate average precision and recall for AUC approximation
     avg_precision = np.mean([metrics['precision'] for metrics in per_class_metrics.values()])
     avg_recall = np.mean([metrics['recall'] for metrics in per_class_metrics.values()])
 
+ # Approximate AUC as the area under the average precision-recall curve
     auc_approx = avg_precision * avg_recall
 
-    if args.local_rank == 0:
-        writer.add_scalar("test/accuracy", accuracy, epoch)
-        writer.add_scalar("test/giou", giou, epoch)
-        writer.add_scalar("test/ciou", ciou, epoch)
-        writer.add_scalar("test/pixel_accuracy", pixel_accuracy, epoch)
-        writer.add_scalar("test/iou", iou, epoch)
-        writer.add_scalar("test/f1_score", f1_score, epoch)
-        writer.add_scalar("test/auc_approx", auc_approx, epoch)
-        for class_name, metrics in per_class_metrics.items():
-         for metric_name, value in metrics.items():
-             writer.add_scalar(f"test/{class_name.lower().replace('/', '_')}_{metric_name}", value, epoch)
+    # Log metrics
+    writer.add_scalar("val/accuracy", accuracy, epoch)
+    writer.add_scalar("val/giou", giou, epoch)
+    writer.add_scalar("val/ciou", ciou, epoch)
+    writer.add_scalar("val/pixel_accuracy", pixel_accuracy, epoch)
+    writer.add_scalar("val/iou", iou, epoch)
+    writer.add_scalar("val/f1_score", f1_score, epoch)
+    writer.add_scalar("val/auc_approx", auc_approx, epoch)
+    for class_name, metrics in per_class_metrics.items():
+        for metric_name, value in metrics.items():
+            writer.add_scalar(f"val/{class_name.lower().replace('/', '_')}_{metric_name}", value, epoch)
 
-        test_type = "Full" if sample_ratio is None else f"Sampled ({sample_ratio*100}%)"
-        print(f"\n{test_type} test Results:")
-        print(f"giou: {giou:.4f}, ciou: {ciou:.4f}")
-        print(f"Classification Accuracy: {accuracy:.4f}%")
-        print(f"Pixel Accuracy: {pixel_accuracy:.4f}%")
-        print(f"IoU: {iou:.4f}")
-        print(f"F1 Score: {f1_score:.4f}")
-        print(f"Approximate AUC: {auc_approx:.4f}")
-        print(f"Total correct classifications: {correct}")
-        print(f"Total classification samples: {total}")
-        print("\nPer-Class Metrics:")
-        for class_name, metrics in per_class_metrics.items():
-            print(f"\n{class_name}:")
-            print(f"  Accuracy:  {metrics['accuracy']:.4f}")
-            print(f"  Precision: {metrics['precision']:.4f}")
-            print(f"  Recall:    {metrics['recall']:.4f}")
-            print(f"  F1 Score:  {metrics['f1']:.4f}")
+    validation_type = "Full" if sample_ratio is None else f"Sampled ({sample_ratio*100}%)"
+    print(f"\n{validation_type} Validation Results:")
+    print(f"giou: {giou:.4f}, ciou: {ciou:.4f}")
+    print(f"Classification Accuracy: {accuracy:.4f}%")
+    print(f"Pixel Accuracy: {pixel_accuracy:.4f}%")
+    print(f"IoU: {iou:.4f}")
+    print(f"F1 Score: {f1_score:.4f}")
+    print(f"Approximate AUC: {auc_approx:.4f}")
+    print(f"Total correct classifications: {correct}")
+    print(f"Total classification samples: {total}")
+    print("\nPer-Class Metrics:")
+    for class_name, metrics in per_class_metrics.items():
+        print(f"\n{class_name}:")
+        print(f"  Accuracy:  {metrics['accuracy']:.4f}")
+        print(f"  Precision: {metrics['precision']:.4f}")
+        print(f"  Recall:    {metrics['recall']:.4f}")
+        print(f"  F1 Score:  {metrics['f1']:.4f}")
 
-        print("\nConfusion Matrix:")
-        print("Predicted ")
-        print("Actual ")
-        print(f"{'':20}", end="")  
-        for name in class_names:
-            print(f"{name:>12}", end="") 
-        print()  
+    print("\nConfusion Matrix:")
+    print("Predicted ")
+    print("Actual ")
+    print(f"{'':20}", end="")  # Add initial spacing
+    for name in class_names:
+        print(f"{name:>12}", end="")  # Align class names
+    print()  # New line
 
-        for i, class_name in enumerate(class_names):
-            print(f"{class_name:20}", end="") 
-            for j in range(num_classes):
-                print(f"{confusion_matrix[i, j]:12.0f}", end="")
-            print()  
+    for i, class_name in enumerate(class_names):
+        print(f"{class_name:20}", end="")  # Left align class names with fixed width
+        for j in range(num_classes):
+            print(f"{confusion_matrix[i, j]:12.0f}", end="")
+        print()  # New line
 
     return accuracy, giou, ciou, per_class_metrics
 

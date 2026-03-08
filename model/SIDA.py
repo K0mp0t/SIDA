@@ -226,13 +226,11 @@ class SIDAForCausalLM(LlavaLlamaForCausalLM):
             torch.zeros((seg_token_mask.shape[0], 1),   dtype=torch.bool, device=input_ids.device)], dim=1)
 
         if inference:
-            n_batch = 1
-            length = input_ids.shape[0]
-            assert images_clip.shape[0] == 1
-            images_clip_extend = images_clip.expand(length, -1, -1, -1).contiguous()
+            n_batch = input_ids.shape[0]
+            images_clip_extend = images_clip.expand(n_batch, -1, -1, -1).contiguous()
             output_hidden_states = []
             for i in range(n_batch):
-                start_i, end_i = i * length, min((i + 1) * length, input_ids.shape[0])
+                start_i, end_i = i * n_batch, min((i + 1) * n_batch, input_ids.shape[0])
                 output_i = super().forward(
                     images=images_clip_extend[: end_i - start_i],
                     attention_mask=attention_masks[start_i:end_i],
@@ -357,6 +355,8 @@ class SIDAForCausalLM(LlavaLlamaForCausalLM):
             "logits": logits,
             }
             for batch_idx in range(len(pred_masks)):
+                if cls_labels[batch_idx] != 2:
+                    continue
                 gt_mask = gt_masks[batch_idx]
                 pred_mask = pred_masks[batch_idx]
                 assert (
