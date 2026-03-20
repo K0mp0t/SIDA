@@ -205,9 +205,9 @@ class CustomDataset(torch.utils.data.Dataset):
         self.invalid_samples = []  # Track problematic samples
 
         # Load images and verify counts
-        real_images = glob.glob(os.path.join(split_dir, "real", "*.jpg"))
-        full_syn_images = glob.glob(os.path.join(split_dir, "full_synthetic", "*.png"))
-        tampered_images = glob.glob(os.path.join(split_dir, "tampered", "*.png"))
+        real_images = glob.glob(os.path.join(split_dir, "real", "*.jpg")) + glob.glob(os.path.join(split_dir, "real", "*.png"))
+        full_syn_images = glob.glob(os.path.join(split_dir, "full_synthetic", "*.jpg")) + glob.glob(os.path.join(split_dir, "full_synthetic", "*.png"))
+        tampered_images = glob.glob(os.path.join(split_dir, "tampered", "*.jpg")) + glob.glob(os.path.join(split_dir, "tampered", "*.png"))
 
         # Verify tampered images have corresponding masks
         valid_tampered_images = []

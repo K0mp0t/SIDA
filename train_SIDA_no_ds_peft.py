@@ -219,7 +219,7 @@ def main(args):
         )
         model = get_peft_model(model, lora_config)
         model.print_trainable_parameters()
-    model.resize_token_embeddings(len(tokenizer))
+    model.resize_token_embeddings(len(tokenizer))#, pad_to_multiple_of=8)
 
     for n, p in model.named_parameters():
         if "lm_head" in n:
@@ -286,6 +286,13 @@ def main(args):
         shuffle=True,
     )
 
+    model.to(torch_dtype).to('cuda:0')
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    warmup_steps = args.epochs * args.steps_per_epoch * 0.05
+    warmup_scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.1, end_factor=1.0, total_iters=warmup_steps)
+    regular_scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.9998)
+    scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer, [warmup_scheduler, regular_scheduler], milestones=[warmup_steps])
+
     if args.auto_resume and len(args.resume) == 0:
         resume_dir = os.path.join(args.log_dir,  "ckpt_model")
         if os.path.exists(resume_dir):
@@ -295,7 +302,10 @@ def main(args):
 
     if args.resume:
         # load_path, client_state = model.load_checkpoint(args.resume)
-        model.load_state_dict(torch.load(args.resume))
+        state_dict = torch.load(args.resume, map_location='cpu')
+        model.load_state_dict(state_dict["model_state"])
+        optimizer.load_state_dict(state_dict["optimizer_state"])
+        scheduler.load_state_dict(state_dict["lr_scheduler_state"])
         args.start_epoch = int(os.path.basename(args.resume).split('.')[0].split('_')[1]) + 1
         print(
             "resume training from {}, start from epoch {}".format(
@@ -325,13 +335,6 @@ def main(args):
     if args.eval_only:
         acc, giou, ciou, _ = validate(val_loader, model, 0, writer, args)  # Classification validation
         exit()
-
-    model.to(torch_dtype).to('cuda:0')
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
-    warmup_steps = args.epochs * args.steps_per_epoch * 0.05
-    warmup_scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.1, end_factor=1.0, total_iters=warmup_steps)
-    regular_scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.9998)
-    scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer, [warmup_scheduler, regular_scheduler], milestones=[warmup_steps])
 
     validation_epochs = [1,3,5,7,10]
     print(f"\nTraining Configuration:")
@@ -364,7 +367,7 @@ def main(args):
 
             print(f"Current accuracy: {acc:.2f}%, Best accuracy: {best_acc:.2f}%")
             print(f"Current iou: {cur_ciou:.2f}%, Best score: {best_score:.2f}%")
-            # Save checkpoints for best performance
+            
             if args.no_eval or is_best:
                 save_dir = os.path.join(args.log_dir, "ckpt_model")
                 torch.save(
@@ -374,20 +377,25 @@ def main(args):
                                 f"meta_log_acc{best_acc:.3f}_iou{best_score:.3f}.pth"
                             ),
                 )
-                if os.path.exists(save_dir):
-                    shutil.rmtree(save_dir)
-                os.makedirs(save_dir, exist_ok=True)
-                torch.save(model.state_dict(), os.path.join(save_dir, f'checkpoint_{epoch}.pth'))
         else:
             print(f"Epoch {epoch + 1} completed. Skipping validation.")
 
-        # Save final epoch regardless of validation
+        save_dir = os.path.join(args.log_dir, "ckpt_model")
         if epoch == args.epochs - 1:
-            save_dir = os.path.join(args.log_dir, "final_checkpoint")
+            os.makedirs(save_dir, exist_ok=True)
+            torch.save(model.state_dict(), os.path.join(save_dir, f'checkpoint_{epoch}.pth'))
+
+        else:
             if os.path.exists(save_dir):
                 shutil.rmtree(save_dir)
             os.makedirs(save_dir, exist_ok=True)
-            torch.save(model.state_dict(), os.path.join(save_dir, f'checkpoint_{epoch}.pth'))
+            state_dict = {
+                "model_state": model.state_dict(),
+                "optimizer_state": optimizer.state_dict(),
+                "lr_scheduler_state": scheduler.state_dict()
+            }
+            torch.save(state_dict, os.path.join(save_dir, f'checkpoint_{epoch}.pth'))
+
 
 def train(
     train_loader,
@@ -567,8 +575,8 @@ def validate(val_loader, model_engine, epoch, writer, args, sample_ratio=None):
             acc_iou_meter.update(acc_iou, n=masks_list.shape[0])
 
     iou_class = intersection_meter.sum / (union_meter.sum + 1e-10)
-    ciou = iou_class[1] if len(iou_class) > 1 else 0.0
-    giou = acc_iou_meter.avg[1] if len(acc_iou_meter.avg) > 1 else 0.0
+    ciou = iou_class[1] if hasattr(iou_class, 'len') and len(iou_class) > 1 else 0.0
+    giou = acc_iou_meter.avg[1] if hasattr(acc_iou_meter.avg, 'len') and len(acc_iou_meter.avg) > 1 else 0.0
 
     # Calculate classification accuracy
     accuracy = correct / total * 100.0
@@ -598,8 +606,9 @@ def validate(val_loader, model_engine, epoch, writer, args, sample_ratio=None):
         }
 
     # Calculate pixel accuracy
-    pixel_correct = intersection_meter.sum[1]  # Correctly classified pixels (excluding background)
-    pixel_total = union_meter.sum[1]  # Total pixels (excluding background)
+    pixel_correct = intersection_meter.sum[1] if hasattr(intersection_meter.sum, 'len') and len(intersection_meter.sum) > 1 else 0.0
+    pixel_total = union_meter.sum[1] if hasattr(union_meter.sum, 'len') and len(union_meter.sum) > 1 else 0.0
+
     pixel_accuracy = pixel_correct / (pixel_total + 1e-10) * 100.0
 
     iou = ciou  # Use ciou as the IoU for the foreground class

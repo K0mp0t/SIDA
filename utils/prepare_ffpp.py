@@ -11,8 +11,6 @@ from tqdm.contrib.concurrent import thread_map
 
 img_size = 1024
 ignore_label = 255
-pixel_mean = torch.Tensor([123.675, 116.28, 103.53]).view(-1, 1, 1)
-pixel_std = torch.Tensor([58.395, 57.12, 57.375]).view(-1, 1, 1)
 
 
 step = 25

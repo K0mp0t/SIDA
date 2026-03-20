@@ -7,7 +7,7 @@ from functools import partial
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 import numpy as np
 import torch
-import tqdm
+from tqdm.auto import tqdm
 import transformers
 from peft import LoraConfig, get_peft_model
 from torch.utils.tensorboard import SummaryWriter
@@ -23,6 +23,9 @@ from utils.utils import (DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN,
 import random
 import torch.nn.functional as F
 import warnings
+import cv2
+
+
 warnings.filterwarnings("ignore")
 
 def parse_args(args):
@@ -99,7 +102,7 @@ def parse_args(args):
         type=str,
         choices=["llava_v1", "llava_llama_2"],
     )
-    parser.add_argument("--weight", default="", type=str, required=True)
+    parser.add_argument("--weight", default=None, type=str, required=False)
 
     return parser.parse_args(args)
 def main(args):
@@ -257,52 +260,35 @@ def main(args):
     )
     print('Number of samples to test on:', len(test_dataset))
 
-    test_loader = torch.utils.data.DataLoader(
-        test_dataset,
-        batch_size=args.test_batch_size,
-        num_workers=args.workers,
-        pin_memory=True,
-        collate_fn=partial(
-                collate_fn,
-                tokenizer=tokenizer,
-                conv_type=args.conv_type,
-                use_mm_start_end=args.use_mm_start_end,
-                local_rank=args.local_rank,
-            ),
-    )
-
-    state_dict = torch.load(args.weight, map_location="cpu")
-    if "model_state" in state_dict:
-        state_dict = state_dict["model_state"]
-    model.load_state_dict(state_dict, strict=True)
+    if args.weight is not None:
+        state_dict = torch.load(args.weight, map_location="cpu")
+        if "model_state" in state_dict:
+            state_dict = state_dict["model_state"]
+        model.load_state_dict(state_dict, strict=True)
     model = model.to(torch_dtype).to('cuda:0')
 
-    test(test_loader, model, 0, writer, args) 
+    collate_fn_kwargs = {
+        "tokenizer": tokenizer,
+        "conv_type": args.conv_type,
+        "use_mm_start_end": args.use_mm_start_end,
+        "local_rank": args.local_rank
+        }
+
+    visualize_masks(test_dataset, model, 0, writer, args, collate_fn_kwargs) 
 
 
-def test(test_loader, model_engine, epoch, writer, args, sample_ratio=None):
+def visualize_masks(test_dataset, model_engine, epoch, writer, args, collate_fn_kwargs, sample_ratio=None, num_masks_to_visualize=24):
+    output_dir = './vis_out/SIDset_CelebDF'
+    if os.path.exists(output_dir):
+        shutil.rmtree(output_dir)
+    os.makedirs(output_dir)
     model_engine.eval()
-    correct = 0
-    total = 0
-    num_classes = 3
-    confusion_matrix = torch.zeros(num_classes, num_classes, device='cuda')
-    intersection_meter = AverageMeter("Intersec", ":6.3f", Summary.SUM)
-    union_meter = AverageMeter("Union", ":6.3f", Summary.SUM)
-    acc_iou_meter = AverageMeter("gIoU", ":6.3f", Summary.SUM)
 
-    # Calculate total number of batches and samples to use
-    total_batches = len(test_loader)
-    if sample_ratio is not None:
-        num_batches = max(1, int(total_batches * sample_ratio))
-        # Generate random indices for sampling
-        sample_indices = set(random.sample(range(total_batches), num_batches))
-        print(f"\ntest on {num_batches}/{total_batches} randomly sampled batches...")
+    data_idxs = [i for i, e in enumerate(test_dataset.cls_labels) if e == 2]
 
-    for batch_idx, input_dict in enumerate(tqdm.tqdm(test_loader)):
-        # Skip batches not in our sample if sampling is enabled
-        if sample_ratio is not None and batch_idx not in sample_indices:
-            continue
-
+    for item_idx in tqdm(random.choices(data_idxs, k = num_masks_to_visualize)):
+        item = test_dataset[item_idx]
+        input_dict = collate_fn([item], **collate_fn_kwargs)
         torch.cuda.empty_cache()
         input_dict = dict_to_cuda(input_dict)
 
@@ -320,122 +306,27 @@ def test(test_loader, model_engine, epoch, writer, args, sample_ratio=None):
             output_dict = model_engine(**input_dict)
 
         # Get predictions
-        logits = output_dict["logits"]
-        probs = F.softmax(logits, dim=1)
-        preds = torch.argmax(probs, dim=1)
         cls_labels = input_dict["cls_labels"]
-        correct += (preds == cls_labels).sum().item()
-        total += cls_labels.size(0)
+        
+        pred_masks = output_dict["pred_masks"]
+        masks_list = output_dict["gt_masks"][0].int() 
 
-        for t, p in zip(cls_labels, preds):
-            confusion_matrix[t.long(), p.long()] += 1
-        if cls_labels[0] == 2:
-            pred_masks = output_dict["pred_masks"]
-            masks_list = output_dict["gt_masks"][0].int()
-            output_list = (pred_masks[0] > 0).int()
-            assert len(pred_masks) == 1
+        pred_mask = ((pred_masks[0][0] > 0).to(torch.uint8) * 255).cpu().numpy()
+        gt_mask = (masks_list[0].to(torch.uint8) * 255).cpu().numpy()
 
-            intersection, union, acc_iou = 0.0, 0.0, 0.0
-            for mask_i, output_i in zip(masks_list, output_list):
-                intersection_i, union_i, _ = intersectionAndUnionGPU(
-                    output_i.contiguous().clone(), mask_i.contiguous(), 2, ignore_index=255
-                )
-                intersection += intersection_i
-                union += union_i
-                acc_iou += intersection_i / (union_i + 1e-5)
-                acc_iou[union_i == 0] += 1.0  # no-object target
-            intersection, union = intersection.cpu().numpy(), union.cpu().numpy()
-            acc_iou = acc_iou.cpu().numpy() / masks_list.shape[0]
-            intersection_meter.update(intersection)
-            union_meter.update(union)
-            acc_iou_meter.update(acc_iou, n=masks_list.shape[0])
+        pred_mask[gt_mask[gt_mask == 255]] = 255
 
-    iou_class = intersection_meter.sum / (union_meter.sum + 1e-10)
-    ciou = iou_class[1] if hasattr(iou_class, 'len') and len(iou_class) > 1 else 0.0
-    giou = acc_iou_meter.avg[1] if hasattr(acc_iou_meter.avg, 'len') and len(acc_iou_meter.avg) > 1 else 0.0
+        pred_mask = cv2.cvtColor(pred_mask, cv2.COLOR_GRAY2BGR)
+        gt_mask = cv2.cvtColor(gt_mask, cv2.COLOR_GRAY2BGR)
 
-    accuracy = correct / total * 100.0
-    confusion_matrix = confusion_matrix.cpu()
-    class_names = ['Real', 'Full Synthetic', 'Tampered']
-    per_class_metrics = {}
-    for i in range(num_classes):
-        tp = confusion_matrix[i, i]  
-        fp = confusion_matrix[:, i].sum() - tp  
-        fn = confusion_matrix[i, :].sum() - tp 
-        tn = confusion_matrix.sum() - (tp + fp + fn)  
+        image = cv2.imread(input_dict["image_paths"][0])
+        coef = min(pred_mask.shape[0] / image.shape[0], pred_mask.shape[1] / image.shape[1])
+        image = cv2.resize(image, None, fx=coef, fy=coef, interpolation=cv2.INTER_CUBIC)
+        image = cv2.copyMakeBorder(image, 0, pred_mask.shape[0] - image.shape[0], 0, pred_mask.shape[1] - image.shape[1], cv2.BORDER_CONSTANT, value=255)
 
-        total_class_samples = confusion_matrix[i, :].sum()
+        vis = np.hstack([image, pred_mask, gt_mask])
+        cv2.imwrite(os.path.join(output_dir, os.path.basename(input_dict["image_paths"][0])), vis)
 
-        class_accuracy = float(tp / total_class_samples) if total_class_samples > 0 else 0.0
-        precision = float(tp / (tp + fp)) if (tp + fp) > 0 else 0.0
-        recall = float(tp / (tp + fn)) if (tp + fn) > 0 else 0.0
-        f1 = float(2 * (precision * recall) / (precision + recall)) if (precision + recall) > 0 else 0.0
-
-        per_class_metrics[class_names[i]] = {
-            'accuracy': class_accuracy,
-            'precision': precision,
-            'recall': recall,
-            'f1': f1
-        }
-
-    pixel_correct = intersection_meter.sum[1] if hasattr(intersection_meter.sum, 'len') and len(intersection_meter.sum) > 1 else 0.0
-    pixel_total = union_meter.sum[1] if hasattr(union_meter.sum, 'len') and len(union_meter.sum) > 1 else 0.0
-    
-    pixel_accuracy = pixel_correct / (pixel_total + 1e-10) * 100.0
-
-    iou = ciou
-    f1_score = 2 * (iou * accuracy / 100) / (iou + accuracy / 100 + 1e-10) if (iou + accuracy / 100) > 0 else 0.0
-
-    avg_precision = np.mean([metrics['precision'] for metrics in per_class_metrics.values()])
-    avg_recall = np.mean([metrics['recall'] for metrics in per_class_metrics.values()])
-
-    auc_approx = avg_precision * avg_recall
-
-    if args.local_rank == 0:
-        writer.add_scalar("test/accuracy", accuracy, epoch)
-        writer.add_scalar("test/giou", giou, epoch)
-        writer.add_scalar("test/ciou", ciou, epoch)
-        writer.add_scalar("test/pixel_accuracy", pixel_accuracy, epoch)
-        writer.add_scalar("test/iou", iou, epoch)
-        writer.add_scalar("test/f1_score", f1_score, epoch)
-        writer.add_scalar("test/auc_approx", auc_approx, epoch)
-        for class_name, metrics in per_class_metrics.items():
-         for metric_name, value in metrics.items():
-             writer.add_scalar(f"test/{class_name.lower().replace('/', '_')}_{metric_name}", value, epoch)
-
-        test_type = "Full" if sample_ratio is None else f"Sampled ({sample_ratio*100}%)"
-        print(f"\n{test_type} test Results:")
-        print(f"giou: {giou:.4f}, ciou: {ciou:.4f}")
-        print(f"Classification Accuracy: {accuracy:.4f}%")
-        print(f"Pixel Accuracy: {pixel_accuracy:.4f}%")
-        print(f"IoU: {iou:.4f}")
-        print(f"F1 Score: {f1_score:.4f}")
-        print(f"Approximate AUC: {auc_approx:.4f}")
-        print(f"Total correct classifications: {correct}")
-        print(f"Total classification samples: {total}")
-        print("\nPer-Class Metrics:")
-        for class_name, metrics in per_class_metrics.items():
-            print(f"\n{class_name}:")
-            print(f"  Accuracy:  {metrics['accuracy']:.4f}")
-            print(f"  Precision: {metrics['precision']:.4f}")
-            print(f"  Recall:    {metrics['recall']:.4f}")
-            print(f"  F1 Score:  {metrics['f1']:.4f}")
-
-        print("\nConfusion Matrix:")
-        print("Predicted ")
-        print("Actual ")
-        print(f"{'':20}", end="")  
-        for name in class_names:
-            print(f"{name:>12}", end="") 
-        print()  
-
-        for i, class_name in enumerate(class_names):
-            print(f"{class_name:20}", end="") 
-            for j in range(num_classes):
-                print(f"{confusion_matrix[i, j]:12.0f}", end="")
-            print()  
-
-    return accuracy, giou, ciou, per_class_metrics
 
 if __name__ == "__main__":
     main(sys.argv[1:])

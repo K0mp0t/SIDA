@@ -4,3 +4,5 @@ runs
 venv
 weights
 **/*.pyc
+vis_out
+.idea
